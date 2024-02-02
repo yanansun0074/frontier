@@ -1,0 +1,263 @@
+---
+title: "FloodingStreet"
+author: "Yanan Sun"
+format: html
+editor: visual
+---
+
+## Street Flooding Data
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(sf)
+
+# Read in street flooding data
+D_Flood <- read_csv("./Street_Flooding_20240111.csv")
+
+# Process flooding data: filter 2023 only
+D_Flood2 <- D_Flood %>%
+  mutate(
+#    closed_date = mdy_hms(str_sub(get('Closed Date'), 1, 10)),
+    closed_date = mdy_hms(get('Closed Date')),
+    created_date = mdy_hms(get('Created Date')),
+    diff_hour = time_length(closed_date-created_date, unit="hours"),
+    diff_date = closed_date - created_date,
+    year = year(created_date),
+    month = month(created_date)
+  ) %>%
+  filter(
+    year == 2023,
+    is.na(Longitude) == FALSE,
+    is.na(Latitude) == FALSE,
+  ) %>%
+    st_as_sf(coords = c("Longitude", "Latitude")) %>%
+    st_set_crs(4326)
+```
+
+```{r}
+# Read in 311 Sewer Complaints and process it
+D_sewer <- read_csv("./311_Sewer_Complaints.csv")
+
+D_sewer_2 <- D_sewer %>%
+  mutate(
+    created_date2 = mdy_hms(get('Created Date')),
+    year2 = year(created_date2)
+  ) %>%
+  filter(
+    year2 == 2023,
+    is.na(Longitude) == FALSE,
+    is.na(Latitude) == FALSE,
+  ) %>%
+    st_as_sf(coords = c("Longitude", "Latitude")) %>%
+    st_set_crs(4326)
+```
+
+```{r}
+colnames(D_Flood2)
+colnames(D_ACS)
+colnames(D_sewer)
+view(D_sewer_2)
+```
+
+```{r}
+# Get ACS Data
+my_counties <- c("New York County", "Bronx County", "Queens County", "Kings County", "Richmond County")
+
+D_ACS <- get_acs(
+  geography = "tract",
+  state = "NY",
+  county = my_counties,
+  variables = c(
+    med_inc = "B19013_001",
+    white = "B02001_002",
+    black = "B02001_003",
+    poverty = "B17001_002"
+  ),
+  summary_var = "B01003_001",
+    geometry = TRUE
+) %>%
+   select(-moe, -summary_moe) %>%
+    pivot_wider(names_from = "variable", values_from = "estimate") %>%
+    st_as_sf() %>%
+    mutate(
+        black_perc = black / summary_est,
+        pov_perc = poverty / summary_est
+    ) %>%
+  st_set_crs(4326)
+```
+
+```{r}
+# join flood data with Census data
+D_Flood2_acs <- D_Flood2 %>%
+    st_join(D_ACS, left = FALSE)
+
+D_Sewer_2_acs <- D_sewer_2 %>%
+  st_join(D_ACS, left = FALSE)
+
+# individual complaints data to census track level complaints data
+D_sewer_cen_tract <- D_Sewer_2_acs %>%
+    data.frame() %>%
+    group_by(NAME) %>%
+    summarise(
+        geometry = geometry,
+        n_complaints = n(),
+    ) %>%
+  st_as_sf() %>%
+    na.omit()
+```
+
+```{r}
+view(D_Flood2_acs_sewer)
+```
+
+```{r}
+# individual flooding data to census track level flooding data
+D_Flood_cen_tract <- D_Flood2_acs %>%
+  data.frame() %>%
+    group_by(NAME) %>%
+    summarise(
+        geometry = geometry,
+        n_flood = n(),
+        blk_perc = black_perc[1],
+        pov_perc = pov_perc[1],
+        med_inc = med_inc[1],
+        summary_est = summary_est[1]
+    ) %>%
+  st_as_sf() %>%
+    na.omit()
+```
+
+```{r}
+# Join census tract flood data with sewer census tract data
+D_Flood_cen_tract_2 <- D_Flood_cen_tract %>%
+  st_join(D_sewer_cen_tract, left = TRUE)
+```
+
+### EDA
+
+Which are has the most street flood service request in 2023?
+
+Brooklyn!
+
+```{r}
+D_Flood2_acs %>% 
+  group_by(City) %>%
+  summarise(n = n()) %>%
+    arrange(desc(n))
+```
+
+Visualize where floods complaints are.
+
+An area in staten Island has a high number of flooding in 2023.
+
+```{r}
+D_Flood_cen_tract %>%
+      st_as_sf() %>%
+    ggplot(aes(color = n_flood, fill = n_flood)) +
+    geom_sf()
+```
+
+Correct with population
+
+```{r}
+D_Flood_cen_tract %>%
+  mutate(flood_rate = n_flood / summary_est) %>%
+  ggplot(aes(color = flood_rate, fill = flood_rate)) +
+  geom_sf()
+```
+
+What time in 2023 are there most flooding in NYC?
+
+```{r}
+D_Flood_month <- D_Flood2 %>%
+  data.frame() %>%
+  group_by(month) %>%
+  summarize(
+    flood_by_month = n()
+  )
+
+ggplot(D_Flood_month, aes(x=month, y=flood_by_month)) +
+    geom_bar(stat = "identity", fill=rgb(0.1,0.4,0.5,0.7) )
+   
+```
+
+Relationship between flood complaints and race:
+
+Fewer percentage of Black residents, higher number of flood complaints.
+
+```{r}
+D_Flood_cen_tract %>%
+    ggplot(aes(x = blk_perc, y = n_flood)) +
+    geom_point() +
+    theme_minimal() +
+    labs(
+        x = "Percentage of Black residents in tract",
+        y = "Number of flood service request",
+        title = "Number of flood service request against % Black in a tract"
+    )
+```
+
+Relationship between below poverty level and \# of flood complaints:
+
+As the percentage of people living below poverty level increases, fewer flooding service requests are made.
+
+```{r}
+
+D_Flood_cen_tract %>%
+    ggplot(aes(x = pov_perc, y = n_flood)) +
+    geom_point() +
+    theme_minimal() +
+    labs(
+        x = "Percentage of residents below poverty level in tract",
+        y = "Number of flood service request",
+        title = "Number of flood service request against % of poverty residents in a tract"
+    )
+```
+
+Number of flood complaints Vs. median income:
+
+Bell curve? Number of flood complaints are especially sparse in areas with median income higher than 150,000.
+
+```{r}
+D_Flood_cen_tract %>%
+    ggplot(aes(x = med_inc, y = n_flood)) +
+    geom_point() +
+    theme_minimal() +
+    labs(
+        x = "Median income in tract",
+        y = "Number of flood complaints",
+        title = "Number of flood complaints against median income in a tract"
+    )
+```
+
+Number of sewer complaints Vs. flood service request
+
+Looks like positively corelated.
+
+```{r}
+D_Flood_cen_tract_2 %>%
+    ggplot(aes(x = n_complaints, y = n_flood)) +
+    geom_point() +
+    theme_minimal() +
+    labs(
+        x = "Number of sewer complaints",
+        y = "Number of flood service request",
+        title = "Number of sewer complaints against flood service request in a tract"
+    )
+```
+
+### Linear Model
+
+```{r}
+D_Flood_cen_tract_2 %>%
+data.frame() %>%
+    select(blk_perc, pov_perc, med_inc, summary_est, n_complaints)
+
+# mod <- lm(n_flood ~ blk_perc + pov_perc + med_inc + summary_est + n_complaints, data = D_Flood_cen_tract_2)
+mod <- lm(n_flood ~ n_complaints + pov_perc + med_inc + summary_est + blk_perc, data = D_Flood_cen_tract_2)
+
+
+par(mfrow = c(2, 2))
+plot(mod)
+```
